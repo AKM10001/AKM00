@@ -1,0 +1,38 @@
+name: Fetch Elon Musk Tweets
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'  # Every 5 minutes
+  workflow_dispatch:  # Allow manual trigger
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Fetch tweets
+        run: node musk_monitor.mjs > elon_tweets.json 2>fetch_log.txt
+        continue-on-error: true
+
+      - name: Commit and push if changed
+        run: |
+          git config user.name "Musk Monitor Bot"
+          git config user.email "bot@musk-monitor.local"
+          # Only commit if tweets file exists and changed
+          if [ -f elon_tweets.json ]; then
+            git add elon_tweets.json fetch_log.txt
+            if git diff --staged --quiet; then
+              echo "No changes"
+            else
+              git commit -m "Update: $(date -u +'%Y-%m-%d %H:%M UTC')"
+              git push
+            fi
+          fi
