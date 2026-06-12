@@ -1,0 +1,4 @@
+node_modules/
+.env
+*.log
+~/.musk_monitor/
