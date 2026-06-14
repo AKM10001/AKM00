@@ -1,112 +1,62 @@
 #!/bin/bash
 # check_musk.sh - Check for new Elon Musk tweets and notify via WeChat
-#
-# Data source: GitHub-hosted elon_tweets.json (updated by GitHub Action every 5min)
-# Set GITHUB_RAW_URL to your repo's raw URL, e.g.:
-#   GITHUB_RAW_URL="https://raw.githubusercontent.com/YOU/musk-monitor/main/elon_tweets.json"
-#
-# Or set ELON_FEED_URL to any other JSON endpoint.
-
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-NOTIFY_SCRIPT="$SCRIPT_DIR/wechat_notify.mjs"
-STATE_FILE="${HOME}/.musk_monitor_state.json"
 LOG_FILE="${HOME}/.musk_monitor/log.txt"
-FEED_URL="${GITHUB_RAW_URL:-${ELON_FEED_URL:-}}"
-
 mkdir -p "$(dirname "$LOG_FILE")"
 
-# --- Fetch tweets JSON ---
-TWEETS_JSON=""
+PROXY="${HTTP_PROXY:-http://127.0.0.1:7890}"
+BEARER="Authorization: Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
+UA="User-Agent: Mozilla/5.0"
+QUERY_ID="RyDU3I9VJtPF-Pnl6vrRlw"
 
-if [ -n "$FEED_URL" ]; then
-    # Fetch from remote (GitHub raw or other endpoint)
-    TWEETS_JSON=$(curl -sL --max-time 15 "$FEED_URL" 2>/dev/null) || {
-        echo "[$(date '+%H:%M:%S')] Remote fetch failed" >> "$LOG_FILE"
-        exit 0
-    }
-else
-    # No remote URL configured, try local X.com API (needs proxy/VPN)
-    echo "[$(date '+%H:%M:%S')] No FEED_URL set, trying local X.com API" >> "$LOG_FILE"
-    TWEETS_JSON=$(node "$SCRIPT_DIR/musk_monitor.mjs" 2>/dev/null) || {
-        echo "[$(date '+%H:%M:%S')] Local monitor failed" >> "$LOG_FILE"
-        exit 0
-    }
+# 1. Get guest token
+GT=$(curl -sL --max-time 15 -x "$PROXY" "https://api.x.com/1.1/guest/activate.json" -X POST -H "$BEARER" -H "$UA" | python3 -c 'import json,sys; print(json.load(sys.stdin)["guest_token"])')
+
+if [ -z "$GT" ]; then
+  echo "[$(date "+%H:%M:%S")] Failed to get guest token" >> "$LOG_FILE"
+  exit 0
 fi
 
-# --- Parse and compare ---
-RESULT=$(echo "$TWEETS_JSON" | node -e "
-    const { readFileSync, writeFileSync, existsSync } = require('node:fs');
-    const STATE_FILE = '$STATE_FILE';
+# 2. Fetch tweets - use simple hardcoded encoded strings for reliability
+VARS='%7B%22userId%22%3A%2244196397%22%2C%22count%22%3A10%2C%22includePromotedContent%22%3Afalse%2C%22withQuickPromoteEligibilityTweetFields%22%3Afalse%2C%22withVoice%22%3Afalse%2C%22withV2Timeline%22%3Atrue%7D'
+FEATS='%7B%22responsive_web_graphql_exclude_directive_enabled%22%3Atrue%2C%22view_counts_everywhere_api_enabled%22%3Atrue%2C%22longform_notetweets_consumption_enabled%22%3Atrue%2C%22longform_notetweets_rich_text_read_enabled%22%3Atrue%2C%22longform_notetweets_inline_media_enabled%22%3Atrue%7D'
 
-    let data = '';
-    process.stdin.on('data', c => data += c);
-    process.stdin.on('end', () => {
-        try {
-            const tweets = JSON.parse(data);
-            if (!tweets.status || tweets.status !== 'ok') {
-                console.log('SKIP');
-                process.exit(0);
-            }
+RESP=$(curl -sL --max-time 20 -x "$PROXY" -H "$BEARER" -H "$UA" -H "X-Guest-Token: $GT" \
+  "https://api.x.com/graphql/$QUERY_ID/UserTweets?variables=$VARS&features=$FEATS")
 
-            // Load local state
-            let state = { lastTweetId: null, lastTweetTime: 0, seenIds: [] };
-            if (existsSync(STATE_FILE)) {
-                try { state = JSON.parse(readFileSync(STATE_FILE, 'utf-8')); } catch {}
-            }
-            const seenIds = new Set(state.seenIds || []);
+if [ -z "$RESP" ]; then
+  echo "[$(date "+%H:%M:%S")] Empty API response" >> "$LOG_FILE"
+  exit 0
+fi
 
-            // Find new tweets
-            const allTweets = tweets.newTweets || [];
-            const fresh = [];
-            for (const t of allTweets) {
-                if (!seenIds.has(t.id) && !t.isReply) {
-                    fresh.push(t);
-                    seenIds.add(t.id);
-                }
-            }
+# 3. Parse and detect new tweets
+PARSED=$(echo "$RESP" | node "$SCRIPT_DIR/musk_monitor.mjs" 2>/dev/null)
+NEW_COUNT=$(echo "$PARSED" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(len(d.get("newTweets",[])))' 2>/dev/null || echo "0")
 
-            // Update state
-            if (allTweets.length > 0) {
-                state.lastTweetId = allTweets[0].id;
-                state.lastTweetTime = Date.now();
-            }
-            state.seenIds = [...seenIds].slice(-500);
-            writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+if [ "$NEW_COUNT" = "0" ] || [ -z "$NEW_COUNT" ]; then
+  # echo "[$(date "+%H:%M:%S")] No new tweets" >> "$LOG_FILE"
+  exit 0
+fi
 
-            if (fresh.length === 0) {
-                console.log('NO_NEW');
-                process.exit(0);
-            }
+# 4. Build and send notification
+NOTIFY_MSG=$(echo "$PARSED" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+tweets=d.get("newTweets",[])
+lines=["🚀 马斯克发新推了！"]
+for t in tweets[:3]:
+    text=t.get("text","")[:200]
+    lines.append("")
+    lines.append("📝 "+text+("..." if len(t.get("text",""))>200 else ""))
+    lines.append("🔗 "+t.get("url",""))
+    if t.get("createdAt"):
+        lines.append("🕐 "+t["createdAt"])
+print("\n".join(lines))
+' 2>/dev/null)
 
-            // Build notification
-            const lines = ['🚀 马斯克发新推了！'];
-            for (const t of fresh.slice(-3)) {
-                const text = (t.text || t.title || '').slice(0, 200);
-                lines.push('');
-                lines.push('📝 ' + text + (t.text && t.text.length > 200 ? '...' : ''));
-                lines.push('🔗 ' + (t.url || t.link || ''));
-                if (t.createdAt) lines.push('🕐 ' + t.createdAt);
-            }
-            console.log(lines.join('\n'));
-        } catch(e) {
-            console.log('ERROR:' + e.message);
-        }
-    });
-")
-
-# --- Notify ---
-case "$RESULT" in
-    SKIP|NO_NEW|"")
-        exit 0
-        ;;
-    ERROR:*)
-        echo "[$(date '+%H:%M:%S')] Parse error: $RESULT" >> "$LOG_FILE"
-        exit 0
-        ;;
-    *)
-        echo "$RESULT" | node "$NOTIFY_SCRIPT" 2>> "$LOG_FILE" && \
-        echo "[$(date '+%H:%M:%S')] Notified ${NEW_COUNT:-?} new tweets" >> "$LOG_FILE"
-        ;;
-esac
+if [ -n "$NOTIFY_MSG" ]; then
+  echo "$NOTIFY_MSG" | node "$SCRIPT_DIR/wechat_notify.mjs" 2>> "$LOG_FILE" || true
+  echo "[$(date "+%H:%M:%S")] Notified: $NEW_COUNT new tweets" >> "$LOG_FILE"
+fi
