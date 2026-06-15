@@ -20,8 +20,11 @@ ACCOUNTS=(
 
 log() { echo "[$(date "+%H:%M:%S")] $*" >> "$LOG_FILE"; }
 
-# ---- Time window check: Beijing time 9:00-15:00 ----
+# ---- Time window check: BJT 9:00-11:00, 13:00-15:00 ----
 BJ_HOUR=$(TZ='Asia/Shanghai' date '+%k' | tr -d ' ')
+if [ "$BJ_HOUR" -ge 11 ] && [ "$BJ_HOUR" -lt 13 ]; then
+  exit 0
+fi
 if [ "$BJ_HOUR" -lt 9 ] || [ "$BJ_HOUR" -ge 15 ]; then
   exit 0
 fi
